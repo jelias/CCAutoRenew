@@ -13,7 +13,7 @@ DISABLE_CCUSAGE=false
 
 # Function to log messages
 log_message() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
 }
 
 # Function to handle shutdown
@@ -469,9 +469,13 @@ main() {
         # Calculate how long to sleep
         sleep_duration=$(calculate_sleep_duration)
         log_message "Next check in $((sleep_duration / 60)) minutes"
-        
-        # Sleep until next check
-        sleep "$sleep_duration"
+
+        # Sleep until next check (in small increments to allow graceful shutdown)
+        elapsed=0
+        while [ $elapsed -lt $sleep_duration ]; do
+            sleep 5  # Sleep in 5-second increments
+            elapsed=$((elapsed + 5))
+        done
     done
 }
 
