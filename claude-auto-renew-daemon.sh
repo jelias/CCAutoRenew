@@ -10,6 +10,7 @@ START_TIME_FILE="$HOME/.claude-auto-renew-start-time"
 STOP_TIME_FILE="$HOME/.claude-auto-renew-stop-time"
 MESSAGE_FILE="$HOME/.claude-auto-renew-message"
 DISABLE_CCUSAGE=false
+SLEEP_PID=""  # Track background sleep process for graceful shutdown
 
 # Function to log messages
 log_message() {
@@ -19,6 +20,13 @@ log_message() {
 # Function to handle shutdown
 cleanup() {
     log_message "Daemon shutting down..."
+
+    # Kill the background sleep process if it's running
+    if [ -n "$SLEEP_PID" ] && kill -0 "$SLEEP_PID" 2>/dev/null; then
+        kill "$SLEEP_PID" 2>/dev/null
+        wait "$SLEEP_PID" 2>/dev/null  # Clean up zombie process
+    fi
+
     rm -f "$PID_FILE"
     exit 0
 }
@@ -470,12 +478,11 @@ main() {
         sleep_duration=$(calculate_sleep_duration)
         log_message "Next check in $((sleep_duration / 60)) minutes"
 
-        # Sleep until next check (in small increments to allow graceful shutdown)
-        elapsed=0
-        while [ $elapsed -lt $sleep_duration ]; do
-            sleep 5  # Sleep in 5-second increments
-            elapsed=$((elapsed + 5))
-        done
+        # Sleep until next check (event-driven approach for instant shutdown)
+        sleep "$sleep_duration" &
+        SLEEP_PID=$!
+        wait "$SLEEP_PID" 2>/dev/null
+        SLEEP_PID=""  # Clear after wait completes
     done
 }
 
