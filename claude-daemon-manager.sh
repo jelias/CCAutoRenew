@@ -9,6 +9,10 @@ START_TIME_FILE="$HOME/.claude-auto-renew-start-time"
 STOP_TIME_FILE="$HOME/.claude-auto-renew-stop-time"
 MESSAGE_FILE="$HOME/.claude-auto-renew-message"
 
+# Load shared library
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/ccusage-utils.sh"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -252,24 +256,23 @@ get_daemon_status() {
 # Get next renewal estimate
 get_next_renewal_estimate() {
     get_daemon_timing_info
-    
+
     NEXT_RENEWAL_TIME=""
     NEXT_RENEWAL_REMAINING=""
-    
+
     # Only show if active or no scheduling
     if [ ! -f "$START_TIME_FILE" ] || [ "$CURRENT_EPOCH" -ge "$(cat "$START_TIME_FILE" 2>/dev/null || echo 0)" ]; then
-        if [ -f "$HOME/.claude-last-activity" ]; then
-            last_activity=$(cat "$HOME/.claude-last-activity")
-            time_diff=$((CURRENT_EPOCH - last_activity))
-            remaining=$((18000 - time_diff))
-            
-            if [ $remaining -gt 0 ]; then
-                hours=$((remaining / 3600))
-                minutes=$(((remaining % 3600) / 60))
-                NEXT_RENEWAL_REMAINING="${hours}h ${minutes}m"
-                next_renewal_time=$((CURRENT_EPOCH + remaining))
-                NEXT_RENEWAL_TIME=$(date -d "@$next_renewal_time" '+%H:%M' 2>/dev/null || date -r "$next_renewal_time" '+%H:%M')
-            fi
+        # Use shared library function (ccusage first, fallback to clock)
+        # This sets TIMING_SOURCE and REMAINING_SECONDS globals
+        get_remaining_time
+
+        if [ $? -eq 0 ] && [ "$REMAINING_SECONDS" -gt 0 ]; then
+            local hours=$((REMAINING_SECONDS / 3600))
+            local minutes=$(((REMAINING_SECONDS % 3600) / 60))
+            NEXT_RENEWAL_REMAINING="${hours}h ${minutes}m"
+
+            local next_renewal_time=$((CURRENT_EPOCH + REMAINING_SECONDS))
+            NEXT_RENEWAL_TIME=$(date -d "@$next_renewal_time" '+%H:%M' 2>/dev/null || date -r "$next_renewal_time" '+%H:%M')
         fi
     fi
 }
@@ -302,36 +305,31 @@ generate_day_plan() {
         active_end=$(date -d "$current_date $stop_time_today" +%s 2>/dev/null || date -j -f "%Y-%m-%d %H:%M:%S" "$current_date $stop_time_today" +%s 2>/dev/null)
     fi
     
-    # If we have last activity, calculate potential renewal times
-    if [ -f "$HOME/.claude-last-activity" ]; then
-        last_activity=$(cat "$HOME/.claude-last-activity")
-        
-        # Calculate the first potential renewal after last activity
-        first_renewal=$((last_activity + 18000))  # 5 hours after last activity
-        
-        # Generate renewal times throughout the day
-        current_renewal=$first_renewal
+    # Get accurate remaining time via shared library
+    # This sets TIMING_SOURCE and REMAINING_SECONDS globals
+    get_remaining_time
+
+    if [ $? -eq 0 ] && [ "$REMAINING_SECONDS" -gt 0 ]; then
+        # Calculate next renewal time
+        local next_renewal_epoch=$((CURRENT_EPOCH + REMAINING_SECONDS))
+
+        # Generate renewal times for the day (5-hour intervals)
+        current_renewal=$next_renewal_epoch
+        local is_first_renewal=true
         while [ $current_renewal -lt $day_end_epoch ]; do
             # Check if this renewal time is within active hours
             if [ $current_renewal -ge $active_start ] && [ $current_renewal -le $active_end ]; then
                 renewal_time_str=$(date -d "@$current_renewal" '+%H:%M' 2>/dev/null || date -r "$current_renewal" '+%H:%M')
-                
-                # Mark if this is the next upcoming renewal
-                if [ $current_renewal -gt $CURRENT_EPOCH ]; then
-                    if [ ${#DAY_PLAN[@]} -eq 0 ]; then
-                        # This is the next renewal
-                        DAY_PLAN+=("$renewal_time_str (NEXT)")
-                    else
-                        DAY_PLAN+=("$renewal_time_str")
-                    fi
-                elif [ $current_renewal -le $CURRENT_EPOCH ] && [ $((CURRENT_EPOCH - current_renewal)) -lt 3600 ]; then
-                    # Recent renewal (within last hour)
-                    DAY_PLAN+=("$renewal_time_str (RECENT)")
+
+                # Mark first as NEXT with timing source
+                if [ "$is_first_renewal" = true ]; then
+                    DAY_PLAN+=("$renewal_time_str (NEXT - via $TIMING_SOURCE)")
+                    is_first_renewal=false
                 else
                     DAY_PLAN+=("$renewal_time_str")
                 fi
             fi
-            
+
             # Next renewal is 5 hours later
             current_renewal=$((current_renewal + 18000))
         done
@@ -462,19 +460,22 @@ dash_daemon() {
         get_next_renewal_estimate
         if [ -n "$NEXT_RENEWAL_REMAINING" ]; then
             echo "⏱️  TIME TO NEXT RESET:"
-            # Calculate progress (5 hours = 18000 seconds total)
-            if [ -f "$HOME/.claude-last-activity" ]; then
-                last_activity=$(cat "$HOME/.claude-last-activity")
-                current_time=$(date +%s)
-                time_diff=$((current_time - last_activity))
-                remaining=$((18000 - time_diff))
-                
-                if [ $remaining -gt 0 ]; then
-                    create_progress_bar "$current_time" 18000 "$remaining"
-                    echo "  Next renewal at: $NEXT_RENEWAL_TIME"
-                else
-                    echo "  🚨 Renewal window active now!"
+            # Get accurate remaining time via shared library
+            # This sets TIMING_SOURCE and REMAINING_SECONDS globals
+            get_remaining_time
+
+            if [ $? -eq 0 ] && [ "$REMAINING_SECONDS" -gt 0 ]; then
+                create_progress_bar "$(date +%s)" 18000 "$REMAINING_SECONDS"
+                echo "  Next renewal at: $NEXT_RENEWAL_TIME"
+
+                # Show timing source for transparency
+                if [ "$TIMING_SOURCE" = "ccusage" ]; then
+                    echo "  ℹ️  Timing source: ccusage (accurate)"
+                elif [ "$TIMING_SOURCE" = "clock" ]; then
+                    echo "  ⚠️  Timing source: clock-based (estimated)"
                 fi
+            else
+                echo "  🚨 Renewal window active now!"
             fi
         else
             echo "⏱️  TIME TO NEXT RESET:"

@@ -12,6 +12,10 @@ MESSAGE_FILE="$HOME/.claude-auto-renew-message"
 DISABLE_CCUSAGE=false
 SLEEP_PID=""  # Track background sleep process for graceful shutdown
 
+# Load shared library
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/ccusage-utils.sh"
+
 # Function to log messages
 log_message() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
@@ -26,6 +30,9 @@ cleanup() {
         kill "$SLEEP_PID" 2>/dev/null
         wait "$SLEEP_PID" 2>/dev/null  # Clean up zombie process
     fi
+
+    # Clear daemon config file
+    clear_daemon_config
 
     rm -f "$PID_FILE"
     exit 0
@@ -140,52 +147,6 @@ get_time_until_start() {
     fi
 }
 
-# Function to get ccusage command
-get_ccusage_cmd() {
-    if command -v ccusage &> /dev/null; then
-        echo "ccusage"
-    elif command -v bunx &> /dev/null; then
-        echo "bunx ccusage"
-    elif command -v npx &> /dev/null; then
-        echo "npx ccusage@latest"
-    else
-        return 1
-    fi
-}
-
-# Function to get minutes until reset
-get_minutes_until_reset() {
-    # If ccusage is disabled, return nothing to force time-based checking
-    if [ "$DISABLE_CCUSAGE" = true ]; then
-        return 1
-    fi
-    
-    local ccusage_cmd=$(get_ccusage_cmd)
-    if [ $? -ne 0 ]; then
-        return 1
-    fi
-    
-    # Try to get time remaining from ccusage
-    local output=$($ccusage_cmd blocks 2>/dev/null | grep -i "time remaining" | head -1)
-    
-    if [ -z "$output" ]; then
-        output=$($ccusage_cmd blocks --live 2>/dev/null | grep -i "remaining" | head -1)
-    fi
-    
-    # Parse time
-    local hours=0
-    local minutes=0
-    
-    if [[ "$output" =~ ([0-9]+)h[[:space:]]*([0-9]+)m ]]; then
-        hours=${BASH_REMATCH[1]}
-        minutes=${BASH_REMATCH[2]}
-    elif [[ "$output" =~ ([0-9]+)m ]]; then
-        minutes=${BASH_REMATCH[1]}
-    fi
-    
-    echo $((hours * 60 + minutes))
-}
-
 # Function to start Claude session
 start_claude_session() {
     log_message "Starting Claude session for renewal..."
@@ -298,7 +259,10 @@ main() {
     
     # Save PID
     echo $$ > "$PID_FILE"
-    
+
+    # Save daemon configuration
+    save_daemon_config "$DISABLE_CCUSAGE"
+
     log_message "=== Claude Auto-Renewal Daemon Started ==="
     log_message "PID: $$"
     log_message "Logs: $LOG_FILE"
