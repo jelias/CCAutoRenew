@@ -174,7 +174,8 @@ start_claude_session() {
     
     # Simple approach - macOS compatible
     # Use a subshell with background process for timeout
-    (echo "$selected_message" | claude >> "$LOG_FILE" 2>&1) &
+    # Unset CLAUDECODE to allow renewal from within an existing Claude session
+    (unset CLAUDECODE; echo "$selected_message" | claude >> "$LOG_FILE" 2>&1) &
     local pid=$!
     
     # Wait up to 10 seconds
