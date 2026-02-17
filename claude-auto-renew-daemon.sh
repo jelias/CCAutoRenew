@@ -21,6 +21,32 @@ log_message() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
 }
 
+# Log detailed verification status
+log_verification_status() {
+    local verify_ret=$1
+    local minutes=$((REMAINING_SECONDS / 60))
+    local hours=$((minutes / 60))
+    local mins=$((minutes % 60))
+
+    case $verify_ret in
+        0)
+            log_message "✅ VERIFIED: Active session with $minutes min (${hours}h ${mins}m) remaining"
+            log_message "   Source: $TIMING_SOURCE (API-verified)"
+            ;;
+        1)
+            log_message "❌ FAILED: No timing data from ccusage or clock"
+            ;;
+        2)
+            log_message "❌ FAILED: Clock-based only (not API-verified)"
+            log_message "   Source: $TIMING_SOURCE | Estimated: $minutes min"
+            ;;
+        3)
+            log_message "❌ FAILED: Session exists but not fresh (<4.5h)"
+            log_message "   Source: $TIMING_SOURCE | Remaining: $minutes min (need >270)"
+            ;;
+    esac
+}
+
 # Function to handle shutdown
 cleanup() {
     log_message "Daemon shutting down..."
@@ -172,10 +198,10 @@ start_claude_session() {
         selected_message="${messages[$random_index]}"
     fi
     
-    # Simple approach - macOS compatible
-    # Use a subshell with background process for timeout
+    # Create a persistent session by keeping stdin open for 5 hours
+    # This prevents the session from closing immediately after the first response
     # Unset CLAUDECODE to allow renewal from within an existing Claude session
-    (unset CLAUDECODE; echo "$selected_message" | claude >> "$LOG_FILE" 2>&1) &
+    (unset CLAUDECODE; { echo "$selected_message"; sleep 18000; } | claude >> "$LOG_FILE" 2>&1) &
     local pid=$!
     
     # Wait up to 10 seconds
@@ -196,8 +222,8 @@ start_claude_session() {
     fi
     
     if [ $result -eq 0 ] || [ $result -eq 124 ]; then  # 124 is timeout exit code
-        log_message "Claude session started successfully with message: $selected_message"
-        date +%s > "$LAST_ACTIVITY_FILE"
+        log_message "Claude session process completed with message: $selected_message"
+        # Note: activity file updated only after verification
         return 0
     else
         log_message "ERROR: Failed to start Claude session"
@@ -425,17 +451,112 @@ main() {
         
         # Perform renewal if needed
         if [ "$should_renew" = true ]; then
+            log_message "=== Starting renewal attempt sequence ==="
+
             # Wait a bit to ensure we're in the renewal window
             sleep 60
-            
-            # Try to start session
+
+            # Create the session ONCE
+            log_message "Creating persistent Claude session..."
             if start_claude_session; then
-                log_message "Renewal successful!"
-                # Sleep for 5 minutes after successful renewal
-                sleep 300
+                log_message "Session created, beginning verification loop..."
+
+                # Retry configuration
+                local max_retries=20  # ~30 minutes of retries
+                local attempt=0
+                local retry_delay=30  # Start with 30 seconds
+                local verified=false
+
+                # Verification retry loop with exponential backoff
+                while [ $attempt -lt $max_retries ] && [ "$verified" = false ]; do
+                    attempt=$((attempt + 1))
+
+                    # Check if stop time approaching (but don't abort - user preference)
+                    local current_epoch=$(date +%s)
+                    if [ -f "$STOP_TIME_FILE" ]; then
+                        local stop_epoch=$(cat "$STOP_TIME_FILE")
+                        local time_until_stop=$((stop_epoch - current_epoch))
+                        if [ "$time_until_stop" -gt 0 ] && [ "$time_until_stop" -lt 600 ]; then
+                            log_message "⚠️  Stop time in $((time_until_stop / 60)) minutes, continuing verification attempts..."
+                        fi
+                    fi
+
+                    log_message "Verification attempt $attempt/$max_retries..."
+
+                    # Wait a moment for session to register with API
+                    sleep 5
+
+                    # Verify session is actually active
+                    verify_session_active
+                    local verify_ret=$?
+
+                    # Get verification details
+                    local minutes=$((REMAINING_SECONDS / 60))
+
+                    if [ $verify_ret -eq 0 ]; then
+                        # Success - verified active session
+                        log_message "✅ Renewal verified! Active session with $minutes minutes ($((minutes / 60))h $((minutes % 60))m) remaining"
+                        log_message "   Timing source: $TIMING_SOURCE (API-verified)"
+
+                        # Update activity file now that we've confirmed success
+                        date +%s > "$LAST_ACTIVITY_FILE"
+
+                        verified=true
+
+                        # Sleep for 5 minutes after successful renewal
+                        sleep 300
+                    else
+                        # Verification failed - log details
+                        case $verify_ret in
+                            1)
+                                log_message "❌ Verification failed: No timing data available"
+                                log_message "   ccusage may not be detecting an active session"
+                                ;;
+                            2)
+                                log_message "❌ Verification failed: Only clock-based timing available"
+                                log_message "   Timing source: $TIMING_SOURCE (not API-verified)"
+                                log_message "   Estimated remaining: $minutes minutes"
+                                ;;
+                            3)
+                                log_message "❌ Verification failed: Session not fresh enough"
+                                log_message "   Timing source: $TIMING_SOURCE"
+                                log_message "   Remaining: $minutes minutes (need >270 for fresh renewal)"
+                                ;;
+                        esac
+
+                        # Check if a manual session might exist
+                        if [ $verify_ret -eq 0 ] || [ "$minutes" -gt 60 ]; then
+                            log_message "   Possible manual session detected - stopping verification loop"
+                            verified=true  # Treat as resolved
+                            break
+                        fi
+
+                        # Calculate next retry delay with exponential backoff
+                        if [ $attempt -lt $max_retries ]; then
+                            # Backoff schedule: 30s, 60s, 120s, 300s, then 300s fixed
+                            case $attempt in
+                                1) retry_delay=30 ;;
+                                2) retry_delay=60 ;;
+                                3) retry_delay=120 ;;
+                                *) retry_delay=300 ;;
+                            esac
+
+                            log_message "   Will retry verification in $((retry_delay / 60)) minutes ($retry_delay seconds)..."
+                            sleep $retry_delay
+                        fi
+                    fi
+                done
+
+                # Final outcome logging
+                if [ "$verified" = true ]; then
+                    log_message "=== Renewal sequence completed successfully ==="
+                else
+                    log_message "=== Renewal sequence failed after $max_retries verification attempts ==="
+                    log_message "⚠️  Session created but could not verify via ccusage API"
+                    log_message "⚠️  Session may still be active - check manually with 'ccusage blocks'"
+                fi
             else
-                log_message "Renewal failed, will retry in 1 minute"
-                sleep 60
+                log_message "❌ Failed to create Claude session - aborting renewal"
             fi
         fi
         

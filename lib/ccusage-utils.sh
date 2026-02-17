@@ -64,42 +64,42 @@ get_minutes_until_reset() {
         return 2  # ccusage disabled by flag
     fi
 
-    # Query ccusage
-    local output
-    if [ "$cmd" = "ccusage" ]; then
-        output=$(ccusage blocks 2>/dev/null | grep -i "remaining" | head -1)
-    else
-        output=$($cmd ccusage blocks 2>/dev/null | grep -i "remaining" | head -1)
+    # Check if jq is available for JSON parsing
+    if ! command -v jq &> /dev/null; then
+        return 7  # jq not available for JSON parsing
     fi
 
-    if [ -z "$output" ]; then
+    # Query ccusage blocks in JSON format
+    local json_output
+    if [ "$cmd" = "ccusage" ]; then
+        json_output=$(ccusage blocks --json 2>/dev/null)
+    else
+        json_output=$($cmd ccusage blocks --json 2>/dev/null)
+    fi
+
+    if [ -z "$json_output" ]; then
         return 3  # No output from ccusage
     fi
 
-    # Parse output using regex patterns
-    local hours=0
-    local minutes=0
+    # Extract active block with remaining minutes from JSON
+    local remaining_minutes=$(echo "$json_output" | jq -r '.blocks[] | select(.isActive == true) | .projection.remainingMinutes' 2>/dev/null | head -1)
 
-    # Pattern 1: "3h 24m remaining" → extract hours and minutes
-    if [[ "$output" =~ ([0-9]+)h[[:space:]]*([0-9]+)m ]]; then
-        hours=${BASH_REMATCH[1]}
-        minutes=${BASH_REMATCH[2]}
-    # Pattern 2: "45m remaining" → extract minutes only
-    elif [[ "$output" =~ ([0-9]+)m ]]; then
-        minutes=${BASH_REMATCH[1]}
-    else
-        return 4  # Could not parse output
+    # Check if we got valid data
+    if [ -z "$remaining_minutes" ] || [ "$remaining_minutes" = "null" ]; then
+        return 3  # No active block found
     fi
 
-    # Calculate total minutes
-    local total_minutes=$((hours * 60 + minutes))
+    # Validate it's a number
+    if ! [[ "$remaining_minutes" =~ ^[0-9]+$ ]]; then
+        return 4  # Invalid format
+    fi
 
     # Validate range (0-300 minutes = 5 hours max)
-    if [ "$total_minutes" -lt 0 ] || [ "$total_minutes" -gt 300 ]; then
+    if [ "$remaining_minutes" -lt 0 ] || [ "$remaining_minutes" -gt 300 ]; then
         return 5  # Invalid range
     fi
 
-    echo "$total_minutes"
+    echo "$remaining_minutes"
     return 0
 }
 
@@ -157,6 +157,38 @@ get_remaining_time() {
     TIMING_SOURCE="none"
     REMAINING_SECONDS=0
     return 1
+}
+
+# Verify that an active Claude session exists with sufficient time remaining
+# Returns: 0 if verified active (>60 min via ccusage), 1 otherwise
+# Sets: TIMING_SOURCE and REMAINING_SECONDS globals
+# Note: Accepts any active session with >60 minutes (not just fresh 5-hour sessions)
+verify_session_active() {
+    # Query current session state
+    get_remaining_time
+    local ret=$?
+
+    # Must have timing data
+    if [ $ret -ne 0 ]; then
+        return 1  # No timing available
+    fi
+
+    # Must be ccusage-verified (not clock-based estimation)
+    if [ "$TIMING_SOURCE" != "ccusage" ]; then
+        return 2  # Not API-verified
+    fi
+
+    # Calculate minutes from seconds
+    local minutes=$((REMAINING_SECONDS / 60))
+
+    # Must have >60 minutes (1 hour) remaining - sufficient for continued operation
+    # We don't require a fresh 5-hour session; any active session with time is acceptable
+    if [ "$minutes" -le 60 ]; then
+        return 3  # Not enough time remaining
+    fi
+
+    # Success - verified active session with sufficient time
+    return 0
 }
 
 # Save daemon configuration (called on daemon startup)
