@@ -453,10 +453,17 @@ main() {
         if [ "$should_renew" = true ]; then
             log_message "=== Starting renewal attempt sequence ==="
 
-            # Wait a bit to ensure we're in the renewal window
-            sleep 60
+            # Wait for the old block to expire and the new block to be 1 minute old.
+            # Triggering inside the dying old block causes immediate verification failure
+            # ("not fresh enough") and a gap at the hour boundary ("no timing data").
+            # By waiting until we're 1 minute into the new block, the session is created
+            # in a fresh 5-hour window and verification succeeds on the first attempt.
+            get_remaining_time
+            local wait_for_new_block=$((REMAINING_SECONDS + 60))  # old block + 1 min into new
+            log_message "Waiting ${wait_for_new_block}s for new billing block to be established..."
+            sleep "$wait_for_new_block"
 
-            # Create the session ONCE
+            # Create the session ONCE (now inside the fresh new billing block)
             log_message "Creating persistent Claude session..."
             if start_claude_session; then
                 log_message "Session created, beginning verification loop..."
