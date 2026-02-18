@@ -198,10 +198,11 @@ start_claude_session() {
         selected_message="${messages[$random_index]}"
     fi
     
-    # Create a persistent session by keeping stdin open for 5 hours
-    # This prevents the session from closing immediately after the first response
+    # Ephemeral session: send message and let it close naturally (EOF on pipe)
+    # Claude writes JSONL to disk immediately on session end, allowing ccusage
+    # to detect the new billing block right away for verification.
     # Unset CLAUDECODE to allow renewal from within an existing Claude session
-    (unset CLAUDECODE; { echo "$selected_message"; sleep 18000; } | claude >> "$LOG_FILE" 2>&1) &
+    (unset CLAUDECODE; echo "$selected_message" | claude >> "$LOG_FILE" 2>&1) &
     local pid=$!
     
     # Wait up to 10 seconds
