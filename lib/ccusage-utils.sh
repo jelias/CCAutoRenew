@@ -81,12 +81,26 @@ get_minutes_until_reset() {
         return 3  # No output from ccusage
     fi
 
-    # Extract active block with remaining minutes from JSON
+    # Extract active block data from JSON
+    local active_block=$(echo "$json_output" | jq -r '.blocks[] | select(.isActive == true)' 2>/dev/null | head -1)
+
+    if [ -z "$active_block" ]; then
+        return 3  # No active block found
+    fi
+
+    # Try projection.remainingMinutes first (most accurate)
     local remaining_minutes=$(echo "$json_output" | jq -r '.blocks[] | select(.isActive == true) | .projection.remainingMinutes' 2>/dev/null | head -1)
 
-    # Check if we got valid data
+    # Fall back to endTime calculation if projection not yet available
     if [ -z "$remaining_minutes" ] || [ "$remaining_minutes" = "null" ]; then
-        return 3  # No active block found
+        local end_time=$(echo "$json_output" | jq -r '.blocks[] | select(.isActive == true) | .endTime' 2>/dev/null | head -1)
+        if [ -n "$end_time" ] && [ "$end_time" != "null" ]; then
+            local end_epoch=$(date -d "$end_time" +%s 2>/dev/null)
+            local now_epoch=$(date +%s)
+            remaining_minutes=$(( (end_epoch - now_epoch) / 60 ))
+        else
+            return 3  # No usable timing data
+        fi
     fi
 
     # Validate it's a number
