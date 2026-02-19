@@ -4,10 +4,14 @@
 
 # Config file to track daemon state
 DAEMON_CONFIG_FILE="$HOME/.claude-auto-renew-daemon-config"
+DAEMON_STATE_FILE="$HOME/.claude-auto-renew-state"
 
 # Global variables set by get_remaining_time()
 TIMING_SOURCE=""
 REMAINING_SECONDS=0
+
+# Global variable set by read_state_file()
+BLOCK_END_EPOCH=""
 
 # Get the ccusage command (ccusage, bunx, or npx)
 # Returns: command name or exits with error code
@@ -26,50 +30,19 @@ get_ccusage_cmd() {
     fi
 }
 
-# Check if ccusage is disabled via config file
-# Returns: 0 if disabled, 1 if enabled
-is_ccusage_disabled() {
-    if [ ! -f "$DAEMON_CONFIG_FILE" ]; then
-        return 1  # Not disabled (no config = default enabled)
-    fi
-
-    # Read config file
-    local disable_flag=$(grep "^DISABLE_CCUSAGE=" "$DAEMON_CONFIG_FILE" 2>/dev/null | cut -d'=' -f2)
-    local daemon_pid=$(grep "^DAEMON_PID=" "$DAEMON_CONFIG_FILE" 2>/dev/null | cut -d'=' -f2)
-
-    # Validate PID to detect stale config
-    if [ -n "$daemon_pid" ] && ! kill -0 "$daemon_pid" 2>/dev/null; then
-        # Stale config - daemon not running
-        rm -f "$DAEMON_CONFIG_FILE"
-        return 1  # Treat as enabled
-    fi
-
-    if [ "$disable_flag" = "true" ]; then
-        return 0  # Disabled
-    else
-        return 1  # Enabled
-    fi
-}
-
-# Query ccusage and return minutes remaining
-# Returns: minutes remaining (0-300) or error code
+# Query ccusage and return minutes remaining in the active block
+# Returns: minutes remaining via echo, or error code
+# Return codes: 0=success, 1=no ccusage, 3=no active block, 4=invalid format, 5=invalid range, 7=no jq
 get_minutes_until_reset() {
     local cmd=$(get_ccusage_cmd)
     if [ $? -ne 0 ]; then
         return 1  # ccusage not available
     fi
 
-    # Check if ccusage is disabled
-    if is_ccusage_disabled; then
-        return 2  # ccusage disabled by flag
-    fi
-
-    # Check if jq is available for JSON parsing
     if ! command -v jq &> /dev/null; then
-        return 7  # jq not available for JSON parsing
+        return 7  # jq not available
     fi
 
-    # Query ccusage blocks in JSON format
     local json_output
     if [ "$cmd" = "ccusage" ]; then
         json_output=$(ccusage blocks --json 2>/dev/null)
@@ -81,7 +54,6 @@ get_minutes_until_reset() {
         return 3  # No output from ccusage
     fi
 
-    # Extract active block data from JSON
     local active_block=$(echo "$json_output" | jq -r '.blocks[] | select(.isActive == true)' 2>/dev/null | head -1)
 
     if [ -z "$active_block" ]; then
@@ -103,12 +75,10 @@ get_minutes_until_reset() {
         fi
     fi
 
-    # Validate it's a number
     if ! [[ "$remaining_minutes" =~ ^[0-9]+$ ]]; then
         return 4  # Invalid format
     fi
 
-    # Validate range (0-300 minutes = 5 hours max)
     if [ "$remaining_minutes" -lt 0 ] || [ "$remaining_minutes" -gt 300 ]; then
         return 5  # Invalid range
     fi
@@ -117,57 +87,57 @@ get_minutes_until_reset() {
     return 0
 }
 
-# Fallback: Calculate remaining time from activity file (clock-based)
-# Returns: seconds remaining or error code
-calculate_remaining_from_activity() {
-    local activity_file="$HOME/.claude-last-activity"
-
-    if [ ! -f "$activity_file" ]; then
-        return 1  # No activity file
+# Get the Unix epoch timestamp when the active billing block expires
+# Returns: epoch via echo
+# Return codes: 0=success, 1=no ccusage, 3=no active block, 7=no jq
+get_block_end_epoch() {
+    local cmd=$(get_ccusage_cmd)
+    if [ $? -ne 0 ]; then
+        return 1  # ccusage not available
     fi
 
-    local last_activity=$(cat "$activity_file" 2>/dev/null)
-    if [ -z "$last_activity" ]; then
-        return 2  # Empty file
+    if ! command -v jq &> /dev/null; then
+        return 7  # jq not available
     fi
 
-    local current_epoch=$(date +%s)
-    local elapsed=$((current_epoch - last_activity))
-    local remaining=$((18000 - elapsed))  # 18000 = 5 hours
-
-    if [ "$remaining" -le 0 ]; then
-        return 3  # Session expired
+    local json_output
+    if [ "$cmd" = "ccusage" ]; then
+        json_output=$(ccusage blocks --json 2>/dev/null)
+    else
+        json_output=$($cmd ccusage blocks --json 2>/dev/null)
     fi
 
-    echo "$remaining"
+    if [ -z "$json_output" ]; then
+        return 3  # No output
+    fi
+
+    local end_time=$(echo "$json_output" | jq -r '.blocks[] | select(.isActive == true) | .endTime' 2>/dev/null | head -1)
+
+    if [ -z "$end_time" ] || [ "$end_time" = "null" ]; then
+        return 3  # No active block
+    fi
+
+    local end_epoch=$(date -d "$end_time" +%s 2>/dev/null)
+    if [ -z "$end_epoch" ]; then
+        return 3  # Could not parse time
+    fi
+
+    echo "$end_epoch"
     return 0
 }
 
-# Smart function: Try ccusage first, fall back to clock-based calculation
-# Returns: seconds remaining or error code
-# Sets: TIMING_SOURCE global variable
-# Note: Call this function WITHOUT command substitution to preserve TIMING_SOURCE
-# Example: get_remaining_time; remaining=$?
+# Query ccusage for remaining time in the active block.
+# Sets: TIMING_SOURCE and REMAINING_SECONDS globals
+# Returns: 0 on success, 1 if no data available
 get_remaining_time() {
-    # Try ccusage first
     local minutes=$(get_minutes_until_reset 2>/dev/null)
     local ret=$?
     if [ $ret -eq 0 ] && [ -n "$minutes" ]; then
         TIMING_SOURCE="ccusage"
-        REMAINING_SECONDS=$((minutes * 60))  # Convert to seconds
+        REMAINING_SECONDS=$((minutes * 60))
         return 0
     fi
 
-    # Fallback to clock-based calculation
-    local seconds=$(calculate_remaining_from_activity 2>/dev/null)
-    ret=$?
-    if [ $ret -eq 0 ] && [ -n "$seconds" ]; then
-        TIMING_SOURCE="clock"
-        REMAINING_SECONDS=$seconds
-        return 0
-    fi
-
-    # No timing available
     TIMING_SOURCE="none"
     REMAINING_SECONDS=0
     return 1
@@ -176,48 +146,61 @@ get_remaining_time() {
 # Verify that an active Claude session exists with sufficient time remaining
 # Returns: 0 if verified active (>60 min via ccusage), 1 otherwise
 # Sets: TIMING_SOURCE and REMAINING_SECONDS globals
-# Note: Accepts any active session with >60 minutes (not just fresh 5-hour sessions)
 verify_session_active() {
-    # Query current session state
     get_remaining_time
     local ret=$?
 
-    # Must have timing data
     if [ $ret -ne 0 ]; then
         return 1  # No timing available
     fi
 
-    # Must be ccusage-verified (not clock-based estimation)
     if [ "$TIMING_SOURCE" != "ccusage" ]; then
         return 2  # Not API-verified
     fi
 
-    # Calculate minutes from seconds
     local minutes=$((REMAINING_SECONDS / 60))
 
-    # Must have >60 minutes (1 hour) remaining - sufficient for continued operation
-    # We don't require a fresh 5-hour session; any active session with time is acceptable
     if [ "$minutes" -le 60 ]; then
         return 3  # Not enough time remaining
     fi
 
-    # Success - verified active session with sufficient time
     return 0
 }
 
-# Save daemon configuration (called on daemon startup)
-# Args: $1 = disable_ccusage flag (true/false)
-save_daemon_config() {
-    local disable_flag="$1"
-    local daemon_pid=$$
+# Write block end epoch to state file (read by dashboard)
+write_state_file() {
+    local end_epoch="$1"
+    echo "BLOCK_END_EPOCH=$end_epoch" > "$DAEMON_STATE_FILE"
+}
 
+# Read state file into BLOCK_END_EPOCH global
+# Returns: 0 on success, 1 if unavailable
+read_state_file() {
+    BLOCK_END_EPOCH=""
+    if [ ! -f "$DAEMON_STATE_FILE" ]; then
+        return 1
+    fi
+    local val
+    val=$(grep "^BLOCK_END_EPOCH=" "$DAEMON_STATE_FILE" 2>/dev/null | cut -d= -f2)
+    if [ -z "$val" ]; then
+        return 1
+    fi
+    BLOCK_END_EPOCH="$val"
+    return 0
+}
+
+# Clear state file (called on daemon shutdown)
+clear_state_file() {
+    rm -f "$DAEMON_STATE_FILE"
+}
+
+# Save daemon PID to config file (called on daemon startup)
+save_daemon_config() {
     cat > "$DAEMON_CONFIG_FILE" <<EOF
 # Auto-generated daemon config
 # Created: $(date)
-DAEMON_PID=$daemon_pid
-DISABLE_CCUSAGE=$disable_flag
+DAEMON_PID=$$
 EOF
-
     chmod 600 "$DAEMON_CONFIG_FILE"
 }
 

@@ -9,7 +9,6 @@ LAST_ACTIVITY_FILE="$HOME/.claude-last-activity"
 START_TIME_FILE="$HOME/.claude-auto-renew-start-time"
 STOP_TIME_FILE="$HOME/.claude-auto-renew-stop-time"
 MESSAGE_FILE="$HOME/.claude-auto-renew-message"
-DISABLE_CCUSAGE=false
 SLEEP_PID=""  # Track background sleep process for graceful shutdown
 
 # Load shared library
@@ -34,15 +33,15 @@ log_verification_status() {
             log_message "   Source: $TIMING_SOURCE (API-verified)"
             ;;
         1)
-            log_message "❌ FAILED: No timing data from ccusage or clock"
+            log_message "❌ FAILED: No timing data available from ccusage"
             ;;
         2)
-            log_message "❌ FAILED: Clock-based only (not API-verified)"
-            log_message "   Source: $TIMING_SOURCE | Estimated: $minutes min"
+            log_message "❌ FAILED: Timing source not API-verified"
+            log_message "   Source: $TIMING_SOURCE | Remaining: $minutes min"
             ;;
         3)
-            log_message "❌ FAILED: Session exists but not fresh (<4.5h)"
-            log_message "   Source: $TIMING_SOURCE | Remaining: $minutes min (need >270)"
+            log_message "❌ FAILED: Not enough time remaining (≤60 min)"
+            log_message "   Source: $TIMING_SOURCE | Remaining: $minutes min"
             ;;
     esac
 }
@@ -57,8 +56,9 @@ cleanup() {
         wait "$SLEEP_PID" 2>/dev/null  # Clean up zombie process
     fi
 
-    # Clear daemon config file
+    # Clear daemon config and state files
     clear_daemon_config
+    clear_state_file
 
     rm -f "$PID_FILE"
     exit 0
@@ -232,43 +232,37 @@ start_claude_session() {
     fi
 }
 
-# Function to calculate next check time
-calculate_sleep_duration() {
-    local minutes_remaining=$(get_minutes_until_reset)
-    
-    if [ -n "$minutes_remaining" ] && [ "$minutes_remaining" -gt 0 ]; then
-        log_message "Time remaining: $minutes_remaining minutes"
-        
-        if [ "$minutes_remaining" -le 5 ]; then
-            # Check every 30 seconds when close to reset
-            echo 30
-        elif [ "$minutes_remaining" -le 30 ]; then
-            # Check every 2 minutes when within 30 minutes
-            echo 120
+# Determine the target epoch for the next renewal.
+# Claude billing blocks expire at the top of the hour. Target is 5 minutes
+# past that boundary, giving the new block time to be established.
+# Retries every 5 minutes if ccusage is unavailable.
+# Returns: target epoch via echo, or 0 if no active block (renew immediately)
+get_renewal_target_epoch() {
+    local attempt=0
+    while true; do
+        attempt=$((attempt + 1))
+
+        local end_epoch
+        end_epoch=$(get_block_end_epoch)
+        local ret=$?
+
+        if [ $ret -eq 0 ] && [ -n "$end_epoch" ]; then
+            # Active block found - target is 5 min past the block's end time
+            # Blocks always expire at the top of the hour, so end_epoch + 5 min
+            local target=$(( end_epoch + 300 ))
+            write_state_file "$end_epoch"
+            echo "$target"
+            return 0
+        elif [ $ret -eq 3 ]; then
+            # No active block - signal to renew immediately
+            echo "0"
+            return 0
         else
-            # Check every 10 minutes otherwise
-            echo 600
+            # ccusage/jq unavailable - retry
+            log_message "⚠️  ccusage unavailable (attempt $attempt), retrying in 5 minutes..."
+            sleep 300
         fi
-    else
-        # Fallback: check based on last activity
-        if [ -f "$LAST_ACTIVITY_FILE" ]; then
-            local last_activity=$(cat "$LAST_ACTIVITY_FILE")
-            local current_time=$(date +%s)
-            local time_diff=$((current_time - last_activity))
-            local remaining=$((18000 - time_diff))  # 5 hours = 18000 seconds
-            
-            if [ "$remaining" -le 300 ]; then  # 5 minutes
-                echo 30
-            elif [ "$remaining" -le 1800 ]; then  # 30 minutes
-                echo 120
-            else
-                echo 600
-            fi
-        else
-            # No info available, check every 5 minutes
-            echo 300
-        fi
-    fi
+    done
 }
 
 # Main daemon loop
@@ -289,19 +283,12 @@ main() {
     echo $$ > "$PID_FILE"
 
     # Save daemon configuration
-    save_daemon_config "$DISABLE_CCUSAGE"
+    save_daemon_config
 
     log_message "=== Claude Auto-Renewal Daemon Started ==="
     log_message "PID: $$"
     log_message "Logs: $LOG_FILE"
-    
-    # Log ccusage status
-    if [ "$DISABLE_CCUSAGE" = true ]; then
-        log_message "⚠️  ccusage DISABLED - Using clock-based timing only"
-    else
-        log_message "✅ ccusage ENABLED - Using accurate timing when available"
-    fi
-    
+
     # Check for start and stop times
     if [ -f "$START_TIME_FILE" ]; then
         start_epoch=$(cat "$START_TIME_FILE")
@@ -325,12 +312,17 @@ main() {
         log_message "Using default random greeting messages for renewal"
     fi
     
-    # Check ccusage availability
-    if [ "$DISABLE_CCUSAGE" = false ] && ! get_ccusage_cmd &> /dev/null; then
-        log_message "WARNING: ccusage not found. Using time-based checking."
-        log_message "Install ccusage for more accurate timing: npm install -g ccusage"
+    # Check ccusage/jq availability at startup (non-fatal; get_renewal_target_epoch retries)
+    if ! get_ccusage_cmd &> /dev/null; then
+        log_message "WARNING: ccusage not found. Will retry until available."
+        log_message "Install ccusage: npm install -g ccusage"
+    elif ! command -v jq &> /dev/null; then
+        log_message "WARNING: jq not found. Will retry until available."
+        log_message "Install jq: sudo apt-get install jq"
+    else
+        log_message "✅ ccusage and jq available"
     fi
-    
+
     # Main loop
     while true; do
         # Check if we should schedule next day restart first
@@ -403,195 +395,108 @@ main() {
             fi
         fi
         
-        # Check if we're approaching stop time
-        current_time=$(date +%s)
-        stop_time_approaching=false
-        
-        if [ -f "$STOP_TIME_FILE" ]; then
-            stop_epoch=$(cat "$STOP_TIME_FILE")
-            time_until_stop=$((stop_epoch - current_time))
-            
-            # Don't start new renewals if stop time is within 10 minutes
-            if [ "$time_until_stop" -le 600 ] && [ "$time_until_stop" -gt 0 ]; then
-                stop_time_approaching=true
-                minutes_until_stop=$((time_until_stop / 60))
-                log_message "⚠️  Stop time approaching in ${minutes_until_stop} minutes - no new renewals"
-            fi
-        fi
-        
-        # Get minutes until reset
-        minutes_remaining=$(get_minutes_until_reset)
-        
-        # Check if we should renew (only if not approaching stop time)
-        should_renew=false
-        
-        if [ "$stop_time_approaching" = false ]; then
-            if [ -n "$minutes_remaining" ] && [ "$minutes_remaining" -gt 0 ]; then
-                if [ "$minutes_remaining" -le 2 ]; then
-                    should_renew=true
-                    log_message "Reset imminent ($minutes_remaining minutes), preparing to renew..."
+        # === DETERMINE NEXT RENEWAL TIME ===
+        # Query ccusage for the active block's endTime. Retries every 5 min on error.
+        # Claude blocks always expire at the top of the hour; we target 5 min past that.
+        local target_epoch
+        target_epoch=$(get_renewal_target_epoch)
+
+        if [ "$target_epoch" -eq 0 ]; then
+            # No active block found - fresh start or block already expired; renew now
+            log_message "No active session block found, renewing immediately..."
+        else
+            local renewal_time_str
+            renewal_time_str=$(date -d "@$target_epoch" '+%H:%M')
+
+            # If renewal target is past stop time, sleep until stop and let loop handle it
+            if [ -f "$STOP_TIME_FILE" ]; then
+                local stop_epoch
+                stop_epoch=$(cat "$STOP_TIME_FILE")
+                if [ "$target_epoch" -gt "$stop_epoch" ]; then
+                    local stop_time_str
+                    stop_time_str=$(date -d "@$stop_epoch" '+%H:%M')
+                    log_message "Next renewal at $renewal_time_str is past stop time $stop_time_str — skipping"
+                    local wait_seconds=$(( stop_epoch - $(date +%s) ))
+                    if [ "$wait_seconds" -gt 0 ]; then
+                        sleep "$wait_seconds" &
+                        SLEEP_PID=$!
+                        wait "$SLEEP_PID" 2>/dev/null
+                        SLEEP_PID=""
+                    fi
+                    continue
                 fi
+            fi
+
+            # Sleep precisely until 5 minutes past the next hour boundary
+            local now
+            now=$(date +%s)
+            local wait_seconds=$(( target_epoch - now ))
+            if [ "$wait_seconds" -gt 0 ]; then
+                log_message "Next renewal at $renewal_time_str — sleeping ${wait_seconds}s..."
+                sleep "$wait_seconds" &
+                SLEEP_PID=$!
+                wait "$SLEEP_PID" 2>/dev/null
+                SLEEP_PID=""
             else
-                # Fallback check
-                if [ -f "$LAST_ACTIVITY_FILE" ]; then
-                    last_activity=$(cat "$LAST_ACTIVITY_FILE")
-                    current_time=$(date +%s)
-                    time_diff=$((current_time - last_activity))
-                    
-                    if [ $time_diff -ge 18000 ]; then
-                        should_renew=true
-                        log_message "5 hours elapsed since last activity, renewing..."
-                    fi
-                else
-                    # No activity recorded, safe to start
-                    should_renew=true
-                    log_message "No previous activity recorded, starting initial session..."
-                fi
+                log_message "Target time $renewal_time_str already passed, renewing now..."
             fi
         fi
-        
-        # Perform renewal if needed
-        if [ "$should_renew" = true ]; then
-            log_message "=== Starting renewal attempt sequence ==="
 
-            # Wait for the old block to expire and the new block to be 1 minute old.
-            # Triggering inside the dying old block causes immediate verification failure
-            # ("not fresh enough") and a gap at the hour boundary ("no timing data").
-            # By waiting until we're 1 minute into the new block, the session is created
-            # in a fresh 5-hour window and verification succeeds on the first attempt.
-            get_remaining_time
-            local wait_for_new_block=$((REMAINING_SECONDS + 60))  # old block + 1 min into new
-            log_message "Waiting ${wait_for_new_block}s for new billing block to be established..."
-            sleep "$wait_for_new_block"
+        # === RENEWAL ===
+        log_message "=== Starting renewal ==="
+        if start_claude_session; then
+            log_message "Session created, beginning verification..."
 
-            # Create the session ONCE (now inside the fresh new billing block)
-            log_message "Creating persistent Claude session..."
-            if start_claude_session; then
-                log_message "Session created, beginning verification loop..."
+            local max_retries=20
+            local attempt=0
+            local retry_delay=30
+            local verified=false
 
-                # Retry configuration
-                local max_retries=20  # ~30 minutes of retries
-                local attempt=0
-                local retry_delay=30  # Start with 30 seconds
-                local verified=false
+            while [ $attempt -lt $max_retries ] && [ "$verified" = false ]; do
+                attempt=$((attempt + 1))
+                log_message "Verification attempt $attempt/$max_retries..."
 
-                # Verification retry loop with exponential backoff
-                while [ $attempt -lt $max_retries ] && [ "$verified" = false ]; do
-                    attempt=$((attempt + 1))
+                # Wait a moment for session to register with API
+                sleep 5
 
-                    # Check if stop time approaching (but don't abort - user preference)
-                    local current_epoch=$(date +%s)
-                    if [ -f "$STOP_TIME_FILE" ]; then
-                        local stop_epoch=$(cat "$STOP_TIME_FILE")
-                        local time_until_stop=$((stop_epoch - current_epoch))
-                        if [ "$time_until_stop" -gt 0 ] && [ "$time_until_stop" -lt 600 ]; then
-                            log_message "⚠️  Stop time in $((time_until_stop / 60)) minutes, continuing verification attempts..."
-                        fi
-                    fi
+                verify_session_active
+                local verify_ret=$?
+                local minutes=$(( REMAINING_SECONDS / 60 ))
 
-                    log_message "Verification attempt $attempt/$max_retries..."
-
-                    # Wait a moment for session to register with API
-                    sleep 5
-
-                    # Verify session is actually active
-                    verify_session_active
-                    local verify_ret=$?
-
-                    # Get verification details
-                    local minutes=$((REMAINING_SECONDS / 60))
-
-                    if [ $verify_ret -eq 0 ]; then
-                        # Success - verified active session
-                        log_message "✅ Renewal verified! Active session with $minutes minutes ($((minutes / 60))h $((minutes % 60))m) remaining"
-                        log_message "   Timing source: $TIMING_SOURCE (API-verified)"
-
-                        # Update activity file now that we've confirmed success
-                        date +%s > "$LAST_ACTIVITY_FILE"
-
-                        verified=true
-
-                        # Sleep for 5 minutes after successful renewal
-                        sleep 300
-                    else
-                        # Verification failed - log details
-                        case $verify_ret in
-                            1)
-                                log_message "❌ Verification failed: No timing data available"
-                                log_message "   ccusage may not be detecting an active session"
-                                ;;
-                            2)
-                                log_message "❌ Verification failed: Only clock-based timing available"
-                                log_message "   Timing source: $TIMING_SOURCE (not API-verified)"
-                                log_message "   Estimated remaining: $minutes minutes"
-                                ;;
-                            3)
-                                log_message "❌ Verification failed: Session not fresh enough"
-                                log_message "   Timing source: $TIMING_SOURCE"
-                                log_message "   Remaining: $minutes minutes (need >270 for fresh renewal)"
-                                ;;
+                if [ $verify_ret -eq 0 ]; then
+                    log_message "✅ Renewal verified! Active session with $minutes min ($((minutes/60))h $((minutes%60))m) remaining"
+                    log_message "   Timing source: $TIMING_SOURCE (API-verified)"
+                    date +%s > "$LAST_ACTIVITY_FILE"
+                    verified=true
+                else
+                    log_verification_status "$verify_ret"
+                    if [ $attempt -lt $max_retries ]; then
+                        case $attempt in
+                            1) retry_delay=30 ;;
+                            2) retry_delay=60 ;;
+                            3) retry_delay=120 ;;
+                            *) retry_delay=300 ;;
                         esac
-
-                        # Check if a manual session might exist
-                        if [ $verify_ret -eq 0 ] || [ "$minutes" -gt 60 ]; then
-                            log_message "   Possible manual session detected - stopping verification loop"
-                            verified=true  # Treat as resolved
-                            break
-                        fi
-
-                        # Calculate next retry delay with exponential backoff
-                        if [ $attempt -lt $max_retries ]; then
-                            # Backoff schedule: 30s, 60s, 120s, 300s, then 300s fixed
-                            case $attempt in
-                                1) retry_delay=30 ;;
-                                2) retry_delay=60 ;;
-                                3) retry_delay=120 ;;
-                                *) retry_delay=300 ;;
-                            esac
-
-                            log_message "   Will retry verification in $((retry_delay / 60)) minutes ($retry_delay seconds)..."
-                            sleep $retry_delay
-                        fi
+                        log_message "   Retrying in $((retry_delay/60))m ${retry_delay}s..."
+                        sleep $retry_delay
                     fi
-                done
-
-                # Final outcome logging
-                if [ "$verified" = true ]; then
-                    log_message "=== Renewal sequence completed successfully ==="
-                else
-                    log_message "=== Renewal sequence failed after $max_retries verification attempts ==="
-                    log_message "⚠️  Session created but could not verify via ccusage API"
-                    log_message "⚠️  Session may still be active - check manually with 'ccusage blocks'"
                 fi
-            else
-                log_message "❌ Failed to create Claude session - aborting renewal"
-            fi
-        fi
-        
-        # Calculate how long to sleep
-        sleep_duration=$(calculate_sleep_duration)
-        log_message "Next check in $((sleep_duration / 60)) minutes"
+            done
 
-        # Sleep until next check (event-driven approach for instant shutdown)
-        sleep "$sleep_duration" &
-        SLEEP_PID=$!
-        wait "$SLEEP_PID" 2>/dev/null
-        SLEEP_PID=""  # Clear after wait completes
+            if [ "$verified" = true ]; then
+                log_message "=== Renewal sequence completed successfully ==="
+            else
+                log_message "=== Renewal sequence failed after $max_retries verification attempts ==="
+                log_message "⚠️  Session may still be active - check manually with 'ccusage blocks'"
+            fi
+        else
+            log_message "❌ Failed to create Claude session"
+            sleep 60  # Brief pause before looping back on session start failure
+        fi
+
+        # Loop back to top: query ccusage for the next block's endTime
     done
 }
-
-# Parse command line arguments
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --disableccusage)
-            DISABLE_CCUSAGE=true
-            shift
-            ;;
-        *)
-            shift
-            ;;
-    esac
-done
 
 # Start the daemon
 main

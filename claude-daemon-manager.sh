@@ -35,9 +35,8 @@ start_daemon() {
     # Parse --at and --stop parameters
     START_TIME=""
     STOP_TIME=""
-    DISABLE_CCUSAGE=false
     CUSTOM_MESSAGE=""
-    
+
     # Parse parameters
     while [[ $# -gt 1 ]]; do
         case $2 in
@@ -48,10 +47,6 @@ start_daemon() {
             --stop)
                 STOP_TIME="$3"
                 shift 2
-                ;;
-            --disableccusage)
-                DISABLE_CCUSAGE=true
-                shift
                 ;;
             --message)
                 CUSTOM_MESSAGE="$3"
@@ -136,11 +131,7 @@ start_daemon() {
     fi
     
     print_status "Starting Claude auto-renewal daemon..."
-    if [ "$DISABLE_CCUSAGE" = true ]; then
-        nohup "$DAEMON_SCRIPT" --disableccusage > /dev/null 2>&1 &
-    else
-        nohup "$DAEMON_SCRIPT" > /dev/null 2>&1 &
-    fi
+    nohup "$DAEMON_SCRIPT" > /dev/null 2>&1 &
     
     sleep 2
     
@@ -253,28 +244,30 @@ get_daemon_status() {
     fi
 }
 
-# Get next renewal estimate
+# Get next renewal estimate from daemon state file
 get_next_renewal_estimate() {
     get_daemon_timing_info
 
     NEXT_RENEWAL_TIME=""
     NEXT_RENEWAL_REMAINING=""
 
-    # Only show if active or no scheduling
-    if [ ! -f "$START_TIME_FILE" ] || [ "$CURRENT_EPOCH" -ge "$(cat "$START_TIME_FILE" 2>/dev/null || echo 0)" ]; then
-        # Use shared library function (ccusage first, fallback to clock)
-        # This sets TIMING_SOURCE and REMAINING_SECONDS globals
-        get_remaining_time
-
-        if [ $? -eq 0 ] && [ "$REMAINING_SECONDS" -gt 0 ]; then
-            local hours=$((REMAINING_SECONDS / 3600))
-            local minutes=$(((REMAINING_SECONDS % 3600) / 60))
-            NEXT_RENEWAL_REMAINING="${hours}h ${minutes}m"
-
-            local next_renewal_time=$((CURRENT_EPOCH + REMAINING_SECONDS))
-            NEXT_RENEWAL_TIME=$(date -d "@$next_renewal_time" '+%H:%M' 2>/dev/null || date -r "$next_renewal_time" '+%H:%M')
-        fi
+    read_state_file
+    if [ -z "$BLOCK_END_EPOCH" ]; then
+        return
     fi
+
+    local remaining_secs=$(( BLOCK_END_EPOCH - CURRENT_EPOCH ))
+    if [ "$remaining_secs" -le 0 ]; then
+        return
+    fi
+
+    local hours=$((remaining_secs / 3600))
+    local minutes=$(((remaining_secs % 3600) / 60))
+    NEXT_RENEWAL_REMAINING="${hours}h ${minutes}m"
+
+    # Renewal fires 5 min past block end (blocks expire at the top of the hour)
+    local next_renewal_epoch=$(( BLOCK_END_EPOCH + 300 ))
+    NEXT_RENEWAL_TIME=$(date -d "@$next_renewal_epoch" '+%H:%M' 2>/dev/null || date -r "$next_renewal_epoch" '+%H:%M')
 }
 
 # Generate day plan with estimated renewal times
@@ -305,25 +298,21 @@ generate_day_plan() {
         active_end=$(date -d "$current_date $stop_time_today" +%s 2>/dev/null || date -j -f "%Y-%m-%d %H:%M:%S" "$current_date $stop_time_today" +%s 2>/dev/null)
     fi
     
-    # Get accurate remaining time via shared library
-    # This sets TIMING_SOURCE and REMAINING_SECONDS globals
-    get_remaining_time
+    # Use state file for renewal schedule (written by daemon, no ccusage call needed)
+    read_state_file
 
-    if [ $? -eq 0 ] && [ "$REMAINING_SECONDS" -gt 0 ]; then
-        # Calculate next renewal time
-        local next_renewal_epoch=$((CURRENT_EPOCH + REMAINING_SECONDS))
+    if [ -n "$BLOCK_END_EPOCH" ]; then
+        # First renewal is 5 min past block end (blocks expire at top of hour)
+        local first_renewal=$(( BLOCK_END_EPOCH + 300 ))
 
-        # Generate renewal times for the day (5-hour intervals)
-        current_renewal=$next_renewal_epoch
+        current_renewal=$first_renewal
         local is_first_renewal=true
         while [ $current_renewal -lt $day_end_epoch ]; do
-            # Check if this renewal time is within active hours
             if [ $current_renewal -ge $active_start ] && [ $current_renewal -le $active_end ]; then
                 renewal_time_str=$(date -d "@$current_renewal" '+%H:%M' 2>/dev/null || date -r "$current_renewal" '+%H:%M')
 
-                # Mark first as NEXT with timing source
                 if [ "$is_first_renewal" = true ]; then
-                    DAY_PLAN+=("$renewal_time_str (NEXT - via $TIMING_SOURCE)")
+                    DAY_PLAN+=("$renewal_time_str (NEXT)")
                     is_first_renewal=false
                 else
                     DAY_PLAN+=("$renewal_time_str")
@@ -456,30 +445,19 @@ dash_daemon() {
         fi
         echo ""
         
-        # Show progress bar for next renewal
+        # Show progress bar for next renewal (reads state file, no ccusage call)
         get_next_renewal_estimate
+        echo "⏱️  TIME TO NEXT RESET:"
         if [ -n "$NEXT_RENEWAL_REMAINING" ]; then
-            echo "⏱️  TIME TO NEXT RESET:"
-            # Get accurate remaining time via shared library
-            # This sets TIMING_SOURCE and REMAINING_SECONDS globals
-            get_remaining_time
-
-            if [ $? -eq 0 ] && [ "$REMAINING_SECONDS" -gt 0 ]; then
-                create_progress_bar "$(date +%s)" 18000 "$REMAINING_SECONDS"
+            local remaining_secs=$(( BLOCK_END_EPOCH - $(date +%s) ))
+            if [ "$remaining_secs" -gt 0 ]; then
+                create_progress_bar "$(date +%s)" 18000 "$remaining_secs"
                 echo "  Next renewal at: $NEXT_RENEWAL_TIME"
-
-                # Show timing source for transparency
-                if [ "$TIMING_SOURCE" = "ccusage" ]; then
-                    echo "  ℹ️  Timing source: ccusage (accurate)"
-                elif [ "$TIMING_SOURCE" = "clock" ]; then
-                    echo "  ⚠️  Timing source: clock-based (estimated)"
-                fi
             else
                 echo "  🚨 Renewal window active now!"
             fi
         else
-            echo "⏱️  TIME TO NEXT RESET:"
-            echo "  No active renewal tracking"
+            echo "  No active session block detected"
         fi
         echo ""
         
@@ -604,11 +582,9 @@ case "$1" in
         echo "  start                      - Start the daemon"
         echo "  start --at TIME            - Start daemon but begin monitoring at specified time"
         echo "  start --at TIME --stop END - Start monitoring at TIME, stop at END"
-        echo "  start --disableccusage     - Start daemon without ccusage (clock-based only)"
         echo "  start --message \"text\"     - Use custom message for renewal instead of random greetings"
         echo "                               Examples: --at '09:00' --stop '17:00'"
         echo "                                        --at '2025-01-28 09:00' --stop '2025-01-28 17:00'"
-        echo "                                        --at '09:00' --stop '17:00' --disableccusage"
         echo "                                        --message 'continue working on the React feature'"
         echo "  stop                       - Stop the daemon"
         echo "  restart                    - Restart the daemon"
