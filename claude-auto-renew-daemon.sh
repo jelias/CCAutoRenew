@@ -202,7 +202,7 @@ start_claude_session() {
     # Claude writes JSONL to disk immediately on session end, allowing ccusage
     # to detect the new billing block right away for verification.
     # Unset CLAUDECODE to allow renewal from within an existing Claude session
-    (unset CLAUDECODE; echo "$selected_message" | claude >> "$LOG_FILE" 2>&1) &
+    (unset CLAUDECODE; echo "$selected_message" | claude --model claude-haiku-4-5-20251001 >> "$LOG_FILE" 2>&1) &
     local pid=$!
     
     # Wait up to 10 seconds
