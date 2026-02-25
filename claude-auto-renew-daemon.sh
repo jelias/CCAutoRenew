@@ -10,6 +10,7 @@ START_TIME_FILE="$HOME/.claude-auto-renew-start-time"
 STOP_TIME_FILE="$HOME/.claude-auto-renew-stop-time"
 MESSAGE_FILE="$HOME/.claude-auto-renew-message"
 SLEEP_PID=""  # Track background sleep process for graceful shutdown
+RENEWAL_MODEL="claude-haiku-4-5-20251001"
 
 # Load shared library
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -175,7 +176,7 @@ get_time_until_start() {
 
 # Function to start Claude session
 start_claude_session() {
-    log_message "Starting Claude session for renewal..."
+    log_message "Starting Claude session for renewal (model: $RENEWAL_MODEL)..."
     
     if ! command -v claude &> /dev/null; then
         log_message "ERROR: claude command not found"
@@ -202,7 +203,7 @@ start_claude_session() {
     # Claude writes JSONL to disk immediately on session end, allowing ccusage
     # to detect the new billing block right away for verification.
     # Unset CLAUDECODE to allow renewal from within an existing Claude session
-    (unset CLAUDECODE; echo "$selected_message" | claude --model claude-haiku-4-5-20251001 >> "$LOG_FILE" 2>&1) &
+    (unset CLAUDECODE; echo "$selected_message" | claude --model "$RENEWAL_MODEL" >> "$LOG_FILE" 2>&1) &
     local pid=$!
     
     # Wait up to 10 seconds
