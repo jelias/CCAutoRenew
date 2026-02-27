@@ -448,7 +448,7 @@ main() {
         if start_claude_session; then
             log_message "Session created, beginning verification..."
 
-            local max_retries=20
+            local max_retries=5
             local attempt=0
             local retry_delay=30
             local verified=false

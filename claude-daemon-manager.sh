@@ -475,8 +475,11 @@ dash_daemon() {
         
         # Show recent activity
         if [ -f "$LOG_FILE" ]; then
+            local last_model
+            last_model=$(grep "Starting Claude session for renewal" "$LOG_FILE" | tail -1 | grep -o 'model: [^)]*' | sed 's/model: //')
             echo "📝 RECENT ACTIVITY:"
-            tail -5 "$LOG_FILE" | sed 's/^/  /'
+            [ -n "$last_model" ] && echo "  Last renewal model: $last_model"
+            tail -10 "$LOG_FILE" | sed 's/^/  /'
         else
             echo "📝 RECENT ACTIVITY:"
             echo "  No log file found"
