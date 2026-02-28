@@ -445,6 +445,15 @@ main() {
 
         # === RENEWAL ===
         log_message "=== Starting renewal ==="
+
+        # Skip renewal if any active billing block already exists
+        get_block_end_epoch > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            log_message "✅ Active session already exists — skipping renewal"
+            date +%s > "$LAST_ACTIVITY_FILE"
+            continue
+        fi
+
         if start_claude_session; then
             log_message "Session created, beginning verification..."
 
