@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  account-a:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: claude-renewal-account-a
+    environment:
+      - ANTHROPIC_API_KEY=${ACCOUNT_A_API_KEY}
+      - START_HOUR=6
+      - END_HOUR=17
+    restart: unless-stopped
+    volumes:
+      - account-a-data:/root
+    networks:
+      - claude-net
+
+  account-b:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: claude-renewal-account-b
+    environment:
+      - ANTHROPIC_API_KEY=${ACCOUNT_B_API_KEY}
+      - START_HOUR=9
+      - END_HOUR=17
+    restart: unless-stopped
+    volumes:
+      - account-b-data:/root
+    networks:
+      - claude-net
+
+volumes:
+  account-a-data:
+  account-b-data:
+
+networks:
+  claude-net:
+    driver: bridge
